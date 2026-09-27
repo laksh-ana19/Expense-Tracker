@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const RecurringRule = require('../models/RecurringRule');
 const authMiddleware = require('../middleware/auth');
+const { catchUpRule } = require('../jobs/recurringJob');
 
 router.use(authMiddleware);
 
@@ -46,7 +47,13 @@ router.post('/', async (req, res) => {
       startDate,
       nextDueDate: startDate, // first occurrence is the start date itself
     });
-    res.status(201).json({ message: 'Recurring transaction created.', rule });
+
+    // If the start date is today or in the past, create the transactions that
+    // are already due right away (e.g. start 16 Jul -> Jul, Aug, Sep entries,
+    // next due 16 Oct) instead of waiting for the midnight job.
+    await catchUpRule(rule._id);
+    const updatedRule = await RecurringRule.findById(rule._id);
+    res.status(201).json({ message: 'Recurring transaction created.', rule: updatedRule });
   } catch (err) {
     res.status(500).json({ message: 'Failed to create recurring transaction.', error: err.message });
   }
@@ -66,7 +73,11 @@ router.put('/:id', async (req, res) => {
       { new: true, runValidators: true }
     );
     if (!rule) return res.status(404).json({ message: 'Recurring transaction not found.' });
-    res.json({ message: 'Recurring transaction updated.', rule });
+
+    // An edit or resume can make the rule due now — catch it up immediately.
+    await catchUpRule(rule._id);
+    const updatedRule = await RecurringRule.findById(rule._id);
+    res.json({ message: 'Recurring transaction updated.', rule: updatedRule });
   } catch (err) {
     res.status(500).json({ message: 'Failed to update recurring transaction.', error: err.message });
   }
