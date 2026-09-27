@@ -6,6 +6,11 @@ const CATEGORIES = require('../utils/categories');
 router.use(authMiddleware);
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+// Backup models used only when the main one is busy/unavailable.
+const FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS || 'gemini-3.5-flash,gemini-3.5-flash-lite')
+  .split(',').map((m) => m.trim()).filter(Boolean);
+const MODELS_TO_TRY = [...new Set([GEMINI_MODEL, ...FALLBACK_MODELS])];
+const RETRYABLE_STATUSES = [404, 429, 500, 503, 504];
 
 // POST /api/receipts/scan — sends a compressed receipt photo to Gemini's free
 // vision API and returns { amount, date, category, note }. Unlike the old
@@ -44,37 +49,49 @@ and the merchant/store name if visible.
 If a field genuinely is not visible or not determinable from the image, return
 null for that field instead of guessing.`;
 
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: prompt },
-              { inline_data: { mime_type: mimeType, data: base64Data } },
-            ],
-          }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: 'OBJECT',
-              properties: {
-                amount: { type: 'NUMBER', nullable: true },
-                date: { type: 'STRING', nullable: true },
-                category: { type: 'STRING', enum: CATEGORIES, nullable: true },
-                merchant: { type: 'STRING', nullable: true },
-              },
-            },
+    const requestBody = JSON.stringify({
+      contents: [{
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: mimeType, data: base64Data } },
+        ],
+      }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            amount: { type: 'NUMBER', nullable: true },
+            date: { type: 'STRING', nullable: true },
+            category: { type: 'STRING', enum: CATEGORIES, nullable: true },
+            merchant: { type: 'STRING', nullable: true },
           },
-        }),
-      }
-    );
+        },
+      },
+    });
 
-    if (!geminiRes.ok) {
+    // Try the main model first, then fall back to other models if Google says
+    // it's overloaded (503), rate-limited (429), erroring (500/504) or the
+    // model isn't available (404). Any other error (e.g. a bad key) stops.
+    let geminiRes = null;
+    for (const model of MODELS_TO_TRY) {
+      geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey.trim() },
+          body: requestBody,
+        }
+      );
+      if (geminiRes.ok) break;
+
       const errText = await geminiRes.text().catch(() => '');
-      console.error('Gemini receipt scan failed:', geminiRes.status, errText);
+      console.error(`Gemini receipt scan failed (${model}):`, geminiRes.status, errText);
+      if (!RETRYABLE_STATUSES.includes(geminiRes.status)) break;
+      await new Promise((r) => setTimeout(r, 1000)); // brief pause before the next model
+    }
+
+    if (!geminiRes || !geminiRes.ok) {
       return res.status(502).json({ message: 'Receipt scanning service is unavailable right now. Please try again or fill in the details yourself.' });
     }
 
